@@ -1,4 +1,3 @@
-# run_simulation.py
 from secure_aggregation import generate_key_pair
 from cloud import simulate_cloud
 from server import process_round
