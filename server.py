@@ -1,4 +1,3 @@
-# server.py
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
@@ -13,9 +12,11 @@ def detect_sybil_clients(all_updates, poison_flags=None):
     updates_matrix = np.vstack(all_updates)
     sim_matrix = cosine_similarity(updates_matrix)
 
+    # 1. SYBIL SIMILARITY MATRIX CSV (for Fig5-a heatmap)
+    matrix_df = pd.DataFrame(sim_matrix)
+    matrix_df.to_csv(os.path.join(LOG_DIR, "sybil_similarity_matrix.csv"), index=False)
+
     avg_similarities = np.mean(sim_matrix, axis=1)
-    #for i, sim in enumerate(avg_similarities):
-    #    print(f"[DEBUG] Client {i} | Avg similarity: {sim:.4f}")
 
     candidate_indices = [i for i in range(len(avg_similarities)) if not poison_flags or not poison_flags[i]]
 
@@ -26,6 +27,15 @@ def detect_sybil_clients(all_updates, poison_flags=None):
     for idx in sybil_indices:
         cloud = ["A", "B", "C"][idx // 5]
         print(f"  →  [Cloud {cloud}] Client {(idx % 5) + 1}")
+
+    # 2. SYBIL SIMILARITY CSV (summary with scores)
+    out_df = pd.DataFrame({
+        "client_id": list(range(len(avg_similarities))),
+        "avg_similarity": avg_similarities,
+        "flagged_sybil": [1 if i in sybil_indices else 0 for i in range(len(avg_similarities))]
+    })
+    out_df.to_csv(os.path.join(LOG_DIR, "sybil_similarity.csv"), index=False)
+
     return sybil_indices
 
 
