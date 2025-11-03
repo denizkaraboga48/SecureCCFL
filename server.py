@@ -1,127 +1,514 @@
-import numpy as np
-from sklearn.cluster import KMeans
-from sklearn.metrics.pairwise import cosine_similarity
-from secure_aggregation import generate_key_pair, load_private_key, aggregate_encrypted, decrypt_model_update
 import os
+import csv
+import time
+import pickle
+import hashlib
+from typing import List, Optional
+
+import numpy as np
 import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
+
+from secure_aggregation import (
+    load_private_key,
+    load_public_key,
+    decrypt_vector,
+    decrypt_and_sum_vectors,
+)
 
 LOG_DIR = "logs"
+MODEL_DIR = "models"
 os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
 
-def detect_sybil_clients(all_updates, poison_flags=None):
-    updates_matrix = np.vstack(all_updates)
-    sim_matrix = cosine_similarity(updates_matrix)
-
-    # 1. SYBIL SIMILARITY MATRIX CSV (for Fig5-a heatmap)
-    matrix_df = pd.DataFrame(sim_matrix)
-    matrix_df.to_csv(os.path.join(LOG_DIR, "sybil_similarity_matrix.csv"), index=False)
-
-    avg_similarities = np.mean(sim_matrix, axis=1)
-
-    candidate_indices = [i for i in range(len(avg_similarities)) if not poison_flags or not poison_flags[i]]
-
-    threshold = np.percentile([avg_similarities[i] for i in candidate_indices], 10)
-    sybil_indices = [i for i in candidate_indices if avg_similarities[i] < threshold]
-
-    print("[Sybil Detection] Sybil detected:")
-    for idx in sybil_indices:
-        cloud = ["A", "B", "C"][idx // 5]
-        print(f"  →  [Cloud {cloud}] Client {(idx % 5) + 1}")
-
-    # 2. SYBIL SIMILARITY CSV (summary with scores)
-    out_df = pd.DataFrame({
-        "client_id": list(range(len(avg_similarities))),
-        "avg_similarity": avg_similarities,
-        "flagged_sybil": [1 if i in sybil_indices else 0 for i in range(len(avg_similarities))]
-    })
-    out_df.to_csv(os.path.join(LOG_DIR, "sybil_similarity.csv"), index=False)
-
-    return sybil_indices
+REPUTATION_PATH = os.path.join(LOG_DIR, "reputation.csv")
 
 
-def detect_poisoned_clients(decrypted_updates):
-    flattened = [np.array(update) for update in decrypted_updates]
+def _client_label(i: int, client_labels: Optional[List[str]] = None, clients_per_cloud: int = 5) -> str:
+    if client_labels and i < len(client_labels):
+        return client_labels[i]
+    cloud_idx = i // clients_per_cloud
+    cloud_letter = chr(ord("A") + cloud_idx) if cloud_idx < 26 else f"#{cloud_idx}"
+    return f"[Cloud {cloud_letter}] Client {(i % clients_per_cloud) + 1}"
 
-    means = np.mean(flattened, axis=0)
-    stds = np.std(flattened, axis=0)
 
-    z_scores = []
-    for update in flattened:
-        z = np.abs((update - means) / (stds + 1e-6))
-        z_scores.append(np.mean(z))
-    #print(f"[Poisoning Detection] z_scores: {z_scores}")
-    flags = [int(z > 2.0) for z in z_scores]
+def _load_or_init_reputation(n_clients: int):
+    if os.path.exists(REPUTATION_PATH):
+        try:
+            rep = pd.read_csv(REPUTATION_PATH)
+            if len(rep) == n_clients and "reputation" in rep.columns:
+                return rep["reputation"].values.astype(np.float32)
+        except Exception:
+            pass
+    return np.ones(n_clients, dtype=np.float32)
 
-    df = pd.DataFrame({
-        "client_id": list(range(len(flags))),
-        "z_score": z_scores,
-        "flagged": flags
-    })
-    os.makedirs(LOG_DIR, exist_ok=True)
-    df.to_csv(os.path.join(LOG_DIR, "poisoning_zscores.csv"), index=False)
 
-    #print(f"[Poisoning Detection] flags: {flags}")
-    cloud_map = {0: "A", 1: "B", 2: "C"}
-    print(f"[Poisoning Detection] Poisoned clients detected:")
-    for idx, flagged in enumerate(flags):
-        if flagged:
-            cloud_code = cloud_map.get(idx // 5, "?")
-            print(f"  →  [Cloud {cloud_code}] Client {(idx % 5) + 1}")
+def _save_reputation(rep: np.ndarray):
+    pd.DataFrame({"reputation": rep}).to_csv(REPUTATION_PATH, index=False)
 
-    return flags
 
-def process_round(client_updates):
-    print("Federated server starting")
-    privkey = load_private_key()
+def _mean_stack(updates: List[np.ndarray]) -> np.ndarray:
+    X = np.vstack([np.asarray(u, dtype=np.float32) for u in updates])
+    return np.mean(X, axis=0).astype(np.float32)
 
-    print("[Server] Decrypting individual client updates for detection")
+
+def _prev_plus_delta_and_save(avg_delta: np.ndarray, out_path: str):
+    avg_delta = np.atleast_1d(np.asarray(avg_delta, dtype=np.float32))
+    if os.path.exists(out_path):
+        try:
+            prev = np.load(out_path).astype(np.float32)
+            if prev.shape != avg_delta.shape:
+                prev = np.zeros_like(avg_delta, dtype=np.float32)
+        except Exception:
+            prev = np.zeros_like(avg_delta, dtype=np.float32)
+    else:
+        prev = np.zeros_like(avg_delta, dtype=np.float32)
+    new_weights = prev + avg_delta
+    np.save(out_path, new_weights)
+    print(f"[Server] Global model (fc-only, ABSOLUTE) saved to {out_path}")
+
+
+def _decrypt_all(client_updates, private_key, current_round: int = -1):
     decrypted_updates = []
-    for update in client_updates:
-        decrypted_client_update = []
-        for param in update:
-            decrypted_param = [privkey.decrypt(x) for x in param]
-            decrypted_client_update.extend(decrypted_param)
-        decrypted_updates.append(np.array(decrypted_client_update))
+    os.makedirs(os.path.join(LOG_DIR, "crypto"), exist_ok=True)
+    csv_path = os.path.join(LOG_DIR, "crypto", "crypto_metrics.csv")
+    need_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if need_header:
+            w.writerow(
+                ["round", "client", "cipher_bytes", "plain_bytes", "encrypt_ms", "decrypt_ms", "mode"]
+            )
+        for i, arr in enumerate(client_updates):
+            try:
+                cipher_bytes = sum(len(pickle.dumps(e, protocol=pickle.HIGHEST_PROTOCOL)) for e in arr)
+            except Exception:
+                try:
+                    cipher_bytes = sum(len(e) for e in arr)
+                except Exception:
+                    cipher_bytes = len(arr)
+            t0 = time.perf_counter()
+            plain_list = decrypt_vector(arr, private_key)
+            dec_ms = (time.perf_counter() - t0) * 1000.0
+            plain = np.asarray(plain_list, dtype=np.float32)
+            decrypted_updates.append(plain)
+            w.writerow(
+                [
+                    current_round,
+                    i,
+                    cipher_bytes,
+                    int(plain.nbytes),
+                    "",
+                    f"{dec_ms:.3f}",
+                    "server_decrypt",
+                ]
+            )
+    return decrypted_updates
 
-    lengths = [len(x) for x in decrypted_updates]
-    print("[Server] Decrypted update lengths:", lengths)
-    assert len(set(lengths)) == 1, "Client updates have mismatched lengths!"
 
-       # Poisoning Detection
+def _extract_updates_and_proofs(client_updates):
+    updates, proofs = [], []
+    for item in client_updates:
+        if isinstance(item, dict) and "update" in item:
+            updates.append(item["update"])
+            proofs.append(item.get("zkp", None))
+        else:
+            updates.append(item)
+            proofs.append(None)
+    return updates, proofs
+
+
+def _zkp_verify_log(round_id: int, client_idx: int, size: int, time_ms: float):
+    os.makedirs(os.path.join(LOG_DIR, "zkp"), exist_ok=True)
+    path = os.path.join(LOG_DIR, "zkp", "zkp_metrics.csv")
+    need_header = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "round",
+                "cloud",
+                "client_idx",
+                "client_id",
+                "phase",
+                "size_bytes",
+                "time_ms",
+                "accepted",
+            ],
+        )
+        if need_header:
+            w.writeheader()
+        w.writerow(
+            {
+                "round": round_id,
+                "cloud": "",
+                "client_idx": client_idx,
+                "client_id": client_idx,
+                "phase": "verify",
+                "size_bytes": size,
+                "time_ms": f"{time_ms:.3f}",
+                "accepted": 1,
+            }
+        )
+
+
+def _verify_synthetic_proofs(proofs, current_round: int = -1):
+    any_verified = False
+    for i, p in enumerate(proofs):
+        if p is None:
+            continue
+        t0 = time.perf_counter()
+        _ = hashlib.blake2b(p).digest()
+        dt = (time.perf_counter() - t0) * 1000.0
+        _zkp_verify_log(current_round, i, len(p), dt)
+        any_verified = True
+    if any_verified:
+        print("[Server][ZKP] Synthetic proof verification simulated for received payloads.")
+
+
+def _evaluate_and_log_accuracy(out_path: str, current_round: int, num_clients: int, cfg: dict):
+    try:
+        if not os.path.exists(out_path):
+            print("[Eval] Skipped: no global model file found:", out_path)
+            return
+        from model import ResNetForMNIST
+        from data_utils import get_mnist_dataset
+        import torch
+        from torch.utils.data import DataLoader
+        arch = (cfg or {}).get("arch", "resnet34")
+        net = ResNetForMNIST(num_classes=10, arch=arch, freeze_backbone=True)
+        net.eval()
+        flat = np.load(out_path).astype(np.float32)
+        has_bias = net.backbone.fc.bias is not None
+        w_num = net.backbone.fc.weight.numel()
+        w_vals = torch.tensor(flat[:w_num]).view_as(net.backbone.fc.weight)
+        with torch.no_grad():
+            net.backbone.fc.weight.copy_(w_vals)
+            if has_bias:
+                b_slice = flat[w_num:w_num + net.backbone.fc.bias.numel()]
+                if b_slice.size > 0:
+                    b_vals = torch.tensor(b_slice).view_as(net.backbone.fc.bias)
+                    net.backbone.fc.bias.copy_(b_vals)
+        _, test = get_mnist_dataset()
+        test_loader = DataLoader(test, batch_size=256, shuffle=False)
+        correct = total = 0
+        with torch.no_grad():
+            for x, y in test_loader:
+                logits = net(x)
+                pred = logits.argmax(dim=1)
+                correct += (pred == y).sum().item()
+                total += y.size(0)
+        acc = 100.0 * correct / max(1, total)
+        targeted_asr = ""
+        targeted_correct = ""
+        targeted_total = ""
+        try:
+            target_label = (cfg or {}).get("backdoor_target_label", None)
+            trigger_value = float((cfg or {}).get("backdoor_trigger_value", 1.0))
+            if target_label is not None:
+                synth_n = 128
+                device = next(net.parameters()).device if any(p.requires_grad for p in net.parameters()) else "cpu"
+                x = torch.rand(synth_n, 1, 28, 28) * 255.0
+                x[:, :, 0:2, 0:2] = torch.clamp(x[:, :, 0:2, 0:2] + trigger_value * 255.0, 0, 255)
+                x = x / 255.0
+                x = x.to(device)
+                with torch.no_grad():
+                    logits = net(x)
+                    pred = logits.argmax(dim=1).cpu().numpy()
+                targeted_total = synth_n
+                targeted_correct = int((pred == int(target_label)).sum())
+                targeted_asr = f"{100.0 * targeted_correct / max(1, targeted_total):.2f}"
+                print(f"[Eval] Targeted ASR: {targeted_asr}% ({targeted_correct}/{targeted_total})")
+        except Exception as _e:
+            print("[Eval] Targeted ASR eval skipped:", _e)
+        os.makedirs(LOG_DIR, exist_ok=True)
+        csv_path = os.path.join(LOG_DIR, "extended_eval.csv")
+        need_header = not os.path.exists(csv_path)
+        with open(csv_path, "a", newline="") as f:
+            w = csv.writer(f)
+            if need_header:
+                w.writerow([
+                    "round", "num_clients", "arch",
+                    "accuracy_pct", "correct", "total",
+                    "targeted_asr_pct", "asr_correct", "asr_total"
+                ])
+            w.writerow([
+                current_round, num_clients, arch,
+                f"{acc:.2f}", correct, total,
+                targeted_asr, targeted_correct, targeted_total
+            ])
+    except Exception as e:
+        print("[Eval] Warning: evaluation failed:", e)
+
+
+def _poisoning_detection(decrypted_updates, z_thresh: float = 3.0):
+    if not decrypted_updates:
+        return []
+    norms = np.array([np.linalg.norm(np.asarray(u, dtype=np.float32)) for u in decrypted_updates], dtype=np.float32)
+    mu, sigma = norms.mean(), norms.std() + 1e-8
+    robust_z = (norms - mu) / sigma
+    flags = (np.abs(robust_z) > z_thresh).astype(int)
+    pd.DataFrame(
+        {
+            "client_id": list(range(len(norms))),
+            "l2_norm": norms,
+            "robust_z": robust_z,
+            "flagged": flags,
+        }
+    ).to_csv(os.path.join(LOG_DIR, "poisoning_norms.csv"), index=False)
     print("[Server] Running Poisoning detection")
-    poison_flags = detect_poisoned_clients(decrypted_updates)
-
-    # Sybil Detection
-    print("[Server] Running Sybil detection")
-    sybil_indices = detect_sybil_clients(decrypted_updates, poison_flags)
-
-
-    # Sybil & Poison Overlap Log
-    overlap = set(sybil_indices).intersection(set(i for i, f in enumerate(poison_flags) if f))
-    if overlap:
-        print(f"[WARNING] Clients detected as both Sybil and Poisoned: {list(overlap)}")
+    poisoned_indices = [i for i, f in enumerate(flags) if f == 1]
+    if poisoned_indices:
+        print("[Poisoning Detection] Poisoned clients detected:")
+        for i in poisoned_indices:
+            print(f"  →  {_client_label(i)}")
+    else:
+        print("[Poisoning Detection] No clients flagged.")
+    return poisoned_indices
 
 
-    # Secure Aggregation
-    print("[Server] Starting secure aggregation")
-    aggregated = aggregate_encrypted(client_updates)
+def _sybil_detection(
+    decrypted_updates,
+    poisoned_indices=None,
+    save_matrix: bool = True,
+    client_labels: Optional[List[str]] = None,
+):
+    print("[Server] Running Sybil detection (similarity + reputation)")
+    if not decrypted_updates:
+        print("[Sybil Detection] No client updates available.")
+        return []
+    N = len(decrypted_updates)
+    poisoned_set = set(poisoned_indices or [])
+    candidates = [i for i in range(N) if i not in poisoned_set]
+    if not candidates:
+        print("[Sybil Detection] No non-poison candidates to evaluate.")
+        return []
+    X = np.vstack([np.asarray(u, np.float32) for u in decrypted_updates])
+    sim_thr = 0.95
+    lambda_sim = 0.6
+    rep_alpha = 0.6
+    combined_threshold = 0.60
+    S = cosine_similarity(X)
+    np.fill_diagonal(S, 1.0)
+    sim_score = (S.sum(axis=1) - 1.0) / max(1, (N - 1))
+    rep = _load_or_init_reputation(N)
+    rep = (1 - rep_alpha) * rep + rep_alpha * (sim_score > sim_thr).astype(np.float32)
+    combined = (lambda_sim * sim_score) + ((1.0 - lambda_sim) * rep)
+    sybil_flags = (combined > combined_threshold).astype(int)
+    df = pd.DataFrame(
+        {
+            "client_id": list(range(N)),
+            "sim_score": sim_score,
+            "reputation": rep,
+            "combined": combined,
+            "flagged": sybil_flags,
+        }
+    )
+    df.to_csv(os.path.join(LOG_DIR, "sybil_similarity_reputation.csv"), index=False)
+    _save_reputation(rep)
+    flagged_indices = [i for i, f in enumerate(sybil_flags) if f == 1]
+    if flagged_indices:
+        print("[Sybil Detection] Suspected Sybil clients:")
+        for i in flagged_indices:
+            label = _client_label(i, client_labels=client_labels)
+            print(f"  →  {label} | sim={sim_score[i]:.3f} rep={rep[i]:.3f} comb={combined[i]:.3f}")
+    else:
+        print("[Sybil Detection] No clients flagged.")
+    return flagged_indices
 
-    # Decrypt aggregated model
-    print("[Server] Decrypting aggregated model")
-    decrypted = decrypt_model_update(aggregated, privkey)
 
-    # Global model update
-    flat_model = np.concatenate([np.array(p) for p in decrypted])
-    model_path = os.path.join("models", "global_model.npy")
-    os.makedirs("models", exist_ok=True)
-    np.save(model_path, flat_model)
-    print(f"[Server] Global model updated and saved to {model_path}")
+def _secure_aggregate_and_decrypt(client_updates, pubkey, privkey, average: bool = True):
+    os.makedirs(os.path.join(LOG_DIR, "crypto"), exist_ok=True)
+    csv_path = os.path.join(LOG_DIR, "crypto", "crypto_metrics.csv")
+    need_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if need_header:
+            w.writerow(["round", "client", "cipher_bytes", "plain_bytes", "encrypt_ms", "decrypt_ms", "mode"])
+    try:
+        total_cipher_bytes = sum(
+            sum(len(pickle.dumps(e, protocol=pickle.HIGHEST_PROTOCOL)) for e in arr) for arr in client_updates
+        )
+    except Exception:
+        try:
+            total_cipher_bytes = sum(sum(len(e) for e in arr) for arr in client_updates)
+        except Exception:
+            total_cipher_bytes = sum(len(arr) for arr in client_updates)
+    t0 = time.perf_counter()
+    summed_plain = decrypt_and_sum_vectors(client_updates, privkey)
+    dec_ms = (time.perf_counter() - t0) * 1000
+    arr = np.asarray(summed_plain, dtype=np.float32)
+    avg = arr / max(1, len(client_updates)) if average else arr
+    with open(csv_path, "a", newline="") as f:
+        csv.writer(f).writerow(
+            [
+                "",
+                "SUM",
+                int(total_cipher_bytes),
+                int(arr.nbytes),
+                "",
+                f"{dec_ms:.3f}",
+                "server_sum_decrypt",
+            ]
+        )
+    return avg.astype(np.float32)
 
-def load_global_model():
-    model_path = os.path.join("models", "global_model.npy")
-    if not os.path.exists(model_path):
-        print("[Server] No existing global model found.")
-        return None
-    model = np.load(model_path)
-    print(f"[Server] Global model loaded from {model_path}")
-    return model
+
+def _digest_bytes_from_update(u) -> bytes:
+    try:
+        if isinstance(u, np.ndarray):
+            return u.astype(np.float32, copy=False).tobytes()
+        if isinstance(u, list):
+            arr = np.asarray(u, dtype=np.float32)
+            return arr.tobytes()
+        return str(u).encode("utf-8", errors="ignore")
+    except Exception:
+        return b""
+
+
+def _compute_update_hash_prefix(updates: List) -> str:
+    h = hashlib.sha256()
+    for u in updates:
+        h.update(_digest_bytes_from_update(u))
+    return h.hexdigest()[:16]
+
+
+def _chain_log(round_id: int,
+               n_clients: int,
+               cfg: dict,
+               update_hash_prefix: str,
+               zkp_count: int,
+               n_poisoned: int,
+               n_sybil: int,
+               poisoned_indices=None,
+               sybil_indices=None):
+    os.makedirs(os.path.join(LOG_DIR, "chain"), exist_ok=True)
+    path = os.path.join(LOG_DIR, "chain", "chain_log.csv")
+    need_header = not os.path.exists(path)
+    poisoned_indices = poisoned_indices or []
+    sybil_indices = sybil_indices or []
+    row = {
+        "round": round_id,
+        "n_clients": n_clients,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        "zkp_count": zkp_count,
+        "n_poisoned": n_poisoned,
+        "n_sybil": n_sybil,
+        "poisoned_indices": "|".join(map(str, poisoned_indices)),
+        "sybil_indices": "|".join(map(str, sybil_indices)),
+        "update_hash_prefix": update_hash_prefix,
+        "mode": str(cfg),
+    }
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if need_header:
+            w.writeheader()
+        w.writerow(row)
+    print(f"[Blockchain] Off-chain audit log updated (round={round_id}, flags P={poisoned_indices}, S={sybil_indices})")
+
+
+def _chain_log_detailed(round_id: int, flags_len: int, poisoned_indices, sybil_indices):
+    os.makedirs(os.path.join(LOG_DIR, "chain"), exist_ok=True)
+    path = os.path.join(LOG_DIR, "chain", "chain_anomalies.csv")
+    need_header = not os.path.exists(path)
+    poisoned_set = set(poisoned_indices or [])
+    sybil_set = set(sybil_indices or [])
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["round", "client_idx", "poisoned", "sybil"])
+        if need_header:
+            w.writeheader()
+        for i in range(flags_len):
+            w.writerow({
+                "round": round_id,
+                "client_idx": i,
+                "poisoned": int(i in poisoned_set),
+                "sybil": int(i in sybil_set),
+            })
+
+
+def process_round(
+    client_updates: List[list],
+    cfg: dict = None,
+    public_key=None,
+    private_key=None,
+    client_labels: Optional[List[str]] = None,
+    average_updates: bool = True,
+    current_round: int = -1,
+) -> None:
+    cfg = cfg or {}
+    print("Federated server starting with cfg=", cfg)
+    client_updates, zkp_payloads = _extract_updates_and_proofs(client_updates)
+    if cfg.get("zkp", 0) or any(p is not None for p in zkp_payloads):
+        _verify_synthetic_proofs(zkp_payloads, current_round=current_round)
+    privkey = private_key or load_private_key() if cfg.get("secagg", 0) else None
+    pubkey = public_key or load_public_key() if cfg.get("secagg", 0) else None
+    out_path = os.path.join(MODEL_DIR, "global_model.npy")
+    decrypted_updates = []
+    poisoned_indices, sybil_indices = [], []
+    if cfg.get("sybil", 0) or cfg.get("poison", 0):
+        if not privkey:
+            privkey = load_private_key()
+        decrypted_updates = _decrypt_all(client_updates, privkey, current_round=current_round)
+        poisoned_indices = _poisoning_detection(decrypted_updates, z_thresh=3.0) if cfg.get("poison", 0) else []
+        sybil_indices = _sybil_detection(
+            decrypted_updates,
+            poisoned_indices=poisoned_indices,
+            save_matrix=True,
+            client_labels=client_labels,
+        ) if cfg.get("sybil", 0) else []
+        flagged = set(poisoned_indices) | set(sybil_indices)
+        pool = [u for i, u in enumerate(decrypted_updates) if i not in flagged] or decrypted_updates
+        avg_delta = _mean_stack(pool) if average_updates else np.sum(np.vstack(pool), axis=0).astype(np.float32)
+        _prev_plus_delta_and_save(avg_delta, out_path)
+    else:
+        if cfg.get("secagg", 0):
+            avg_delta = _secure_aggregate_and_decrypt(client_updates, pubkey, privkey, average=average_updates)
+            _prev_plus_delta_and_save(avg_delta, out_path)
+        else:
+            try:
+                plain = [np.atleast_1d(np.asarray(u, dtype=np.float32)) for u in client_updates]
+            except Exception:
+                raise RuntimeError("Expecting plaintext updates when secagg==0 and detection disabled.")
+            avg_delta = _mean_stack(plain) if average_updates else np.sum(np.vstack(plain), axis=0).astype(np.float32)
+            _prev_plus_delta_and_save(avg_delta, out_path)
+    if cfg.get("chain", 0):
+        updates_for_digest = decrypted_updates if len(decrypted_updates) > 0 else client_updates
+        upd_hash = _compute_update_hash_prefix(updates_for_digest)
+        _chain_log(
+            round_id=current_round,
+            n_clients=len(client_updates),
+            cfg=cfg,
+            update_hash_prefix=upd_hash,
+            zkp_count=sum(1 for p in zkp_payloads if p is not None),
+            n_poisoned=len(poisoned_indices),
+            n_sybil=len(sybil_indices),
+            poisoned_indices=poisoned_indices,
+            sybil_indices=sybil_indices,
+        )
+        _chain_log_detailed(current_round, len(client_updates), poisoned_indices, sybil_indices)
+    try:
+        _evaluate_and_log_accuracy(out_path=out_path, current_round=current_round, num_clients=len(client_updates), cfg=cfg)
+    except Exception as _e:
+        print("[Eval] Non-fatal evaluation error:", _e)
+
+
+class Server:
+    def __init__(self, public_key=None, private_key=None, cfg: dict = None, logs_dir: str = LOG_DIR, models_dir: str = MODEL_DIR):
+        self.public_key = public_key or (load_public_key() if cfg and cfg.get("secagg", 0) else None)
+        self.private_key = private_key or (load_private_key() if cfg and cfg.get("secagg", 0) else None)
+        self.logs_dir = logs_dir
+        self.models_dir = models_dir
+        self.cfg = cfg or {}
+        os.makedirs(self.logs_dir, exist_ok=True)
+        os.makedirs(self.models_dir, exist_ok=True)
+
+    def process_round(self, client_updates, client_labels=None, average_updates: bool = True, current_round: int = -1):
+        process_round(
+            client_updates=client_updates,
+            cfg=self.cfg,
+            public_key=self.public_key,
+            private_key=self.private_key,
+            client_labels=client_labels,
+            average_updates=average_updates,
+            current_round=current_round,
+        )
