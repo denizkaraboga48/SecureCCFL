@@ -1,24 +1,27 @@
-# model.py
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torchvision.models import resnet18, resnet34, ResNet34_Weights, ResNet18_Weights
 
-import torch.nn as nn
-import torch.nn.functional as F
-
-class TinyCNN(nn.Module):
-    def __init__(self):
+class ResNetForMNIST(nn.Module):
+    def __init__(self, num_classes: int = 10, arch: str = "resnet18",
+                 freeze_backbone: bool = True, use_pretrained: bool = True):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 2, kernel_size=3, padding=1)   # 20 parametre
-        self.conv2 = nn.Conv2d(2, 2, kernel_size=3, padding=1)   # 38 parametre
-        self.fc = nn.Linear(2, 10)  # 2*10 + 10 = 30
+        if use_pretrained:
+            weights = ResNet34_Weights.IMAGENET1K_V1 if arch == "resnet34" else ResNet18_Weights.IMAGENET1K_V1
+        else:
+            weights = None
+        if arch == "resnet34":
+            self.backbone = resnet34(weights=weights)
+        else:
+            self.backbone = resnet18(weights=weights)
+        self.backbone.conv1 = nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.backbone.maxpool = nn.Identity()
+        in_features = self.backbone.fc.in_features
+        self.backbone.fc = nn.Linear(in_features, num_classes)
+        if freeze_backbone:
+            for name, p in self.backbone.named_parameters():
+                if not name.startswith("fc."):
+                    p.requires_grad = False
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))       # -> [batch, 2, 28, 28]
-        x = F.max_pool2d(x, 2)          # -> [batch, 2, 14, 14]
-        x = F.relu(self.conv2(x))       # -> [batch, 2, 14, 14]
-        x = F.adaptive_avg_pool2d(x, 1) # -> [batch, 2, 1, 1]
-        x = x.view(x.size(0), -1)       # -> [batch, 2]
-        x = self.fc(x)                  # -> [batch, 10]
-        return x
-
+        return self.backbone(x)
