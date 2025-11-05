@@ -8,6 +8,7 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import KMeans
 
 from secure_aggregation import (
     load_private_key,
@@ -40,7 +41,8 @@ def _load_or_init_reputation(n_clients: int):
                 return rep["reputation"].values.astype(np.float32)
         except Exception:
             pass
-    return np.ones(n_clients, dtype=np.float32)
+    # Not: daha tarafsız başlangıç için 0.5 ile başlatıyoruz
+    return np.full(n_clients, 0.5, dtype=np.float32)
 
 
 def _save_reputation(rep: np.ndarray):
@@ -208,6 +210,7 @@ def _evaluate_and_log_accuracy(out_path: str, current_round: int, num_clients: i
             if target_label is not None:
                 synth_n = 128
                 device = next(net.parameters()).device if any(p.requires_grad for p in net.parameters()) else "cpu"
+                import torch
                 x = torch.rand(synth_n, 1, 28, 28) * 255.0
                 x[:, :, 0:2, 0:2] = torch.clamp(x[:, :, 0:2, 0:2] + trigger_value * 255.0, 0, 255)
                 x = x / 255.0
@@ -273,7 +276,7 @@ def _sybil_detection(
     save_matrix: bool = True,
     client_labels: Optional[List[str]] = None,
 ):
-    print("[Server] Running Sybil detection (similarity + reputation)")
+    print("[Server] Running Sybil detection (similarity + K-means + reputation)")
     if not decrypted_updates:
         print("[Sybil Detection] No client updates available.")
         return []
@@ -283,21 +286,62 @@ def _sybil_detection(
     if not candidates:
         print("[Sybil Detection] No non-poison candidates to evaluate.")
         return []
+
+    # Vektörleri ve benzerlikleri hazırla
     X = np.vstack([np.asarray(u, np.float32) for u in decrypted_updates])
+    S = cosine_similarity(X)
+    np.fill_diagonal(S, 1.0)
+
+    # Ortalama benzerlik skoru (self hariç)
+    sim_score = (S.sum(axis=1) - 1.0) / max(1, (N - 1))
+
+    # K-means kümeleme (benzerlik matrisinin satır vektörlerinde)
+    k = 3 if N >= 3 else 2
+    try:
+        km = KMeans(n_clusters=k, random_state=42, n_init=5)
+        cluster_labels = km.fit_predict(S)
+    except Exception:
+        # K-means başarısızsa bütün istemcileri tek kümede ele al
+        cluster_labels = np.zeros(N, dtype=int)
+        k = 1
+
+    cluster_sizes = np.bincount(cluster_labels, minlength=k)
+
+    # Reputation güncellemesi (yüksek benzerlikleri teşvik etmeyen tarafsız başlangıçtan)
     sim_thr = 0.95
     lambda_sim = 0.6
     rep_alpha = 0.6
-    combined_threshold = 0.60
-    S = cosine_similarity(X)
-    np.fill_diagonal(S, 1.0)
-    sim_score = (S.sum(axis=1) - 1.0) / max(1, (N - 1))
     rep = _load_or_init_reputation(N)
     rep = (1 - rep_alpha) * rep + rep_alpha * (sim_score > sim_thr).astype(np.float32)
+
+    # Combined skor
     combined = (lambda_sim * sim_score) + ((1.0 - lambda_sim) * rep)
-    sybil_flags = (combined > combined_threshold).astype(int)
+    combined_threshold = 0.60
+
+    # Küçük kümeleri şüpheli kabul et (ör. < max(2, N*0.2))
+    small_cut = max(2, int(max(1, N) * 0.2))
+    small_clusters = set(np.where(cluster_sizes < small_cut)[0].tolist())
+
+    # Aday küme üyeleri + çok yüksek benzerlikliler
+    high_sim_candidates = set(np.where(sim_score > sim_thr)[0].tolist())
+    cluster_candidates = set(i for i, c in enumerate(cluster_labels) if c in small_clusters)
+
+    # Zehirlenmişleri dışarıda bırak
+    cluster_candidates = [i for i in cluster_candidates if i in candidates]
+    high_sim_candidates = [i for i in high_sim_candidates if i in candidates]
+
+    # Nihai Sybil bayrağı: küçük küme ÜYEsi veya yüksek benzerlik + combined eşiği geçenler
+    sybil_flags = np.zeros(N, dtype=int)
+    for i in set(cluster_candidates) | set(high_sim_candidates):
+        if combined[i] > combined_threshold:
+            sybil_flags[i] = 1
+
+    # Loglar
     df = pd.DataFrame(
         {
             "client_id": list(range(N)),
+            "cluster": cluster_labels,
+            "cluster_size": [cluster_sizes[c] for c in cluster_labels],
             "sim_score": sim_score,
             "reputation": rep,
             "combined": combined,
@@ -305,13 +349,27 @@ def _sybil_detection(
         }
     )
     df.to_csv(os.path.join(LOG_DIR, "sybil_similarity_reputation.csv"), index=False)
+
+    # K-means spesifik log
+    pd.DataFrame(
+        {
+            "client_id": list(range(N)),
+            "cluster": cluster_labels,
+            "cluster_size": [cluster_sizes[c] for c in cluster_labels],
+        }
+    ).to_csv(os.path.join(LOG_DIR, "sybil_kmeans.csv"), index=False)
+
     _save_reputation(rep)
+
     flagged_indices = [i for i, f in enumerate(sybil_flags) if f == 1]
     if flagged_indices:
         print("[Sybil Detection] Suspected Sybil clients:")
         for i in flagged_indices:
             label = _client_label(i, client_labels=client_labels)
-            print(f"  →  {label} | sim={sim_score[i]:.3f} rep={rep[i]:.3f} comb={combined[i]:.3f}")
+            print(
+                f"  →  {label} | cluster={cluster_labels[i]} size={cluster_sizes[cluster_labels[i]]} "
+                f"sim={sim_score[i]:.3f} rep={rep[i]:.3f} comb={combined[i]:.3f}"
+            )
     else:
         print("[Sybil Detection] No clients flagged.")
     return flagged_indices
