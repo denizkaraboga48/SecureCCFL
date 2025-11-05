@@ -1,6 +1,5 @@
 import os
 import ast
-import math
 import pandas as pd
 import matplotlib.pyplot as plt
 
@@ -15,10 +14,9 @@ PLOT_DIR = "plots"
 os.makedirs(PLOT_DIR, exist_ok=True)
 
 
-def _save_labels_on_bars(ax, values, fmt="{:.2f}"):
+def _labels_on_bars(ax, values, fmt="{:.2f}"):
     for i, v in enumerate(values):
         ax.text(i, v, fmt.format(v), ha="center", va="bottom", fontsize=10)
-
 
 def plot_sybil_detection():
     path_main = os.path.join(LOG_DIR, "sybil_similarity_reputation.csv")
@@ -37,7 +35,7 @@ def plot_sybil_detection():
 
     plt.figure(figsize=(8, 6))
     if _HAS_SNS:
-        ax = sns.scatterplot(
+        sns.scatterplot(
             data=df,
             x="sim_score", y="combined",
             hue="flagged",
@@ -56,6 +54,7 @@ def plot_sybil_detection():
     plt.savefig(os.path.join(PLOT_DIR, "fig5a_sybil_scatter.png"))
     plt.close()
 
+    # K-means küme büyüklükleri
     if df_km is not None and {"cluster", "cluster_size"}.issubset(df_km.columns):
         cluster_sizes = df_km.drop_duplicates("cluster")["cluster_size"].astype(int)
         labels = df_km.drop_duplicates("cluster")["cluster"].astype(str)
@@ -72,7 +71,6 @@ def plot_sybil_detection():
         plt.close()
 
 
-
 def plot_poisoning_impact():
     path = os.path.join(LOG_DIR, "poisoning_norms.csv")
     if not os.path.exists(path):
@@ -82,17 +80,16 @@ def plot_poisoning_impact():
     df = pd.read_csv(path).sort_values("client_id").reset_index(drop=True)
 
     plt.figure(figsize=(10, 5.5))
-    ax = plt.gca()
     if _HAS_SNS:
         sns.barplot(data=df, x="client_id", y="robust_z", hue="flagged", dodge=False)
+        plt.legend(title="Flagged", loc="upper right")
     else:
+        ax = plt.gca()
         colors = ["C0" if f == 0 else "C3" for f in df.get("flagged", [0]*len(df))]
         ax.bar(df["client_id"].astype(str), df["robust_z"], color=colors)
     plt.title("Fig 5-b: Poisoning Detection — Robust Z-scores")
     plt.xlabel("Client ID")
     plt.ylabel("Robust Z-score (|z| > 3 ⇒ flagged)")
-    if _HAS_SNS:
-        plt.legend(title="Flagged", loc="upper right")
     plt.grid(True, axis="y", alpha=0.25)
     plt.tight_layout()
     plt.savefig(os.path.join(PLOT_DIR, "fig5b_poisoning_zscores.png"))
@@ -100,7 +97,6 @@ def plot_poisoning_impact():
 
 
 def _parse_cfg_string(cfg_str: str) -> dict:
-    """chain_log.csv içindeki mode alanı str(dict) formatında; güvenli şekilde sözlüğe çevir."""
     try:
         d = ast.literal_eval(cfg_str)
         return d if isinstance(d, dict) else {}
@@ -109,21 +105,19 @@ def _parse_cfg_string(cfg_str: str) -> dict:
 
 
 def _load_crypto_bytes_per_round() -> pd.DataFrame:
-    """crypto_metrics.csv -> round bazında şifreli bayt toplamı (uplink benzeri).
-    - Eğer o turda client bazlı satırlar (mode=server_decrypt) varsa: bunların cipher_bytes toplamı.
-    - Aksi halde SUM satırı (mode=server_sum_decrypt) varsa: onun cipher_bytes değeri.
-    """
     path = os.path.join(LOG_DIR, "crypto", "crypto_metrics.csv")
     if not os.path.exists(path):
         return pd.DataFrame(columns=["round", "crypto_bytes"]).astype({"round": int, "crypto_bytes": int})
     df = pd.read_csv(path)
-    if "round" not in df.columns:
-        return pd.DataFrame(columns=["round", "crypto_bytes"])  
+
     def _to_int_safe(x):
         try:
             return int(x)
         except Exception:
             return -1
+
+    if "round" not in df.columns:
+        return pd.DataFrame(columns=["round", "crypto_bytes"])  
     df["round_int"] = df["round"].apply(_to_int_safe)
 
     rows = []
@@ -146,17 +140,38 @@ def _load_zkp_bytes_per_round() -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame(columns=["round", "zkp_bytes"]).astype({"round": int, "zkp_bytes": int})
     df = pd.read_csv(path)
-    if "round" not in df.columns or "size_bytes" not in df.columns:
-        return pd.DataFrame(columns=["round", "zkp_bytes"])  
+
     def _to_int_safe(x):
         try:
             return int(x)
         except Exception:
             return -1
+
+    if not {"round", "size_bytes"}.issubset(df.columns):
+        return pd.DataFrame(columns=["round", "zkp_bytes"])  
     df["round_int"] = df["round"].apply(_to_int_safe)
     d = df[df["round_int"] >= 0].groupby("round_int")["size_bytes"].sum().reset_index()
     d.columns = ["round", "zkp_bytes"]
     return d
+
+
+def _load_comm_bytes_per_round() -> pd.DataFrame:
+    """Opsiyonel: istemci tarafındaki comm_metrics.csv varsa uplink/downlink ayrıştır."""
+    path = os.path.join(LOG_DIR, "comm", "comm_metrics.csv")
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=["round", "uplink_bytes", "downlink_bytes"]).astype({
+            "round": int, "uplink_bytes": int, "downlink_bytes": int
+        })
+    df = pd.read_csv(path)
+    if not {"round", "direction", "bytes"}.issubset(df.columns):
+        return pd.DataFrame(columns=["round", "uplink_bytes", "downlink_bytes"])  # güvenlik
+    pivot = df.pivot_table(index="round", columns="direction", values="bytes", aggfunc="sum").fillna(0)
+    pivot = pivot.rename(columns={"up": "uplink_bytes", "down": "downlink_bytes"}).reset_index()
+    if "uplink_bytes" not in pivot.columns:
+        pivot["uplink_bytes"] = 0
+    if "downlink_bytes" not in pivot.columns:
+        pivot["downlink_bytes"] = 0
+    return pivot.astype({"round": int, "uplink_bytes": int, "downlink_bytes": int})
 
 
 def _load_cfg_per_round() -> pd.DataFrame:
@@ -164,14 +179,13 @@ def _load_cfg_per_round() -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame(columns=["round", "category"])
     df = pd.read_csv(path)
-    if "round" not in df.columns or "mode" not in df.columns:
+    if not {"round", "mode"}.issubset(df.columns):
         return pd.DataFrame(columns=["round", "category"])
 
     rows = []
     for _, row in df.iterrows():
-        r = row.get("round")
         try:
-            r = int(r)
+            r = int(row.get("round"))
         except Exception:
             continue
         cfg = _parse_cfg_string(str(row.get("mode", "{}")))
@@ -185,33 +199,42 @@ def _load_cfg_per_round() -> pd.DataFrame:
         any_security = any([secagg, zkp, sybil, poison, ldp])
         if not any_security:
             if clouds and clouds > 1:
-                cat = "CCFL"  
+                cat = "CCFL"
             else:
-                cat = "FL"    
+                cat = "FL"
         else:
-            cat = "Secure-CCFL" 
-
+            cat = "Secure-CCFL"
         rows.append({"round": r, "category": cat})
-    d = pd.DataFrame(rows).drop_duplicates(subset=["round"], keep="last")
-    return d
+    return pd.DataFrame(rows).drop_duplicates(subset=["round"], keep="last")
 
 
 def plot_communication_overhead_from_csv():
     crypto_df = _load_crypto_bytes_per_round()
     zkp_df = _load_zkp_bytes_per_round()
+    comm_df = _load_comm_bytes_per_round()  
     cfg_df = _load_cfg_per_round()
 
-    if len(crypto_df) == 0 and len(zkp_df) == 0:
-        print("[!] crypto/zkp CSV’leri bulunamadı. Fig 5-c atlanıyor.")
+    if len(crypto_df) == 0 and len(zkp_df) == 0 and len(comm_df) == 0:
+        print("[!] crypto/zkp/comm CSV’leri bulunamadı. Fig 5-c atlanıyor.")
         return
 
     merged = pd.merge(crypto_df, zkp_df, on="round", how="outer").fillna(0)
-    merged["total_bytes"] = merged.get("crypto_bytes", 0) + merged.get("zkp_bytes", 0)
+
+    if len(comm_df) > 0:
+        merged = pd.merge(merged, comm_df, on="round", how="left").fillna(0)
+    else:
+        merged["uplink_bytes"] = 0
+        merged["downlink_bytes"] = 0
+
+
+    merged["total_bytes"] = merged.get("crypto_bytes", 0) + merged.get("zkp_bytes", 0) \
+                             + merged.get("uplink_bytes", 0) + merged.get("downlink_bytes", 0)
+
 
     if len(cfg_df) > 0:
         merged = pd.merge(merged, cfg_df, on="round", how="left")
     else:
-        merged["category"] = "Secure-CCFL"  
+        merged["category"] = "Secure-CCFL"
 
     merged["total_mb"] = merged["total_bytes"] / (1024 * 1024)
 
@@ -227,10 +250,11 @@ def plot_communication_overhead_from_csv():
     plt.title("Fig 5-c: Communication Overhead per Round (from CSV)")
     plt.ylabel("Data per Round (MB)")
     plt.grid(True, axis="y", alpha=0.25)
-    _save_labels_on_bars(ax, grp["total_mb"].tolist(), fmt="{:.2f} MB")
+    _labels_on_bars(ax, grp["total_mb"].tolist(), fmt="{:.2f} MB")
     plt.tight_layout()
     plt.savefig(os.path.join(PLOT_DIR, "fig5c_comm_overhead.png"))
     plt.close()
+
 
 
 def main():
