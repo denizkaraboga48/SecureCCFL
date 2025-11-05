@@ -1,7 +1,8 @@
 import os
+import ast
+import math
 import pandas as pd
 import matplotlib.pyplot as plt
-
 
 try:
     import seaborn as sns
@@ -14,19 +15,12 @@ PLOT_DIR = "plots"
 os.makedirs(PLOT_DIR, exist_ok=True)
 
 
-def _save_annotated_bar(ax, values, fmt="{:.2f}"):
+def _save_labels_on_bars(ax, values, fmt="{:.2f}"):
     for i, v in enumerate(values):
         ax.text(i, v, fmt.format(v), ha="center", va="bottom", fontsize=10)
 
 
 def plot_sybil_detection():
-    """
-    Fig 5-a: Sybil (Cosine + K-means + Reputation)
-    Girdi: logs/sybil_similarity_reputation.csv, logs/sybil_kmeans.csv
-      - Columns (sybil_similarity_reputation.csv): client_id, cluster, cluster_size, sim_score, reputation, combined, flagged
-      - Columns (sybil_kmeans.csv): client_id, cluster, cluster_size
-    Çıktı: plots/fig5a_sybil_scatter.png, plots/fig5a_sybil_cluster_sizes.png
-    """
     path_main = os.path.join(LOG_DIR, "sybil_similarity_reputation.csv")
     path_km = os.path.join(LOG_DIR, "sybil_kmeans.csv")
 
@@ -35,19 +29,19 @@ def plot_sybil_detection():
         return
 
     df = pd.read_csv(path_main)
+    df_km = None
     if os.path.exists(path_km):
         df_km = pd.read_csv(path_km)
-    else:
-  
-        df_km = df[["client_id", "cluster", "cluster_size"]].copy() if "cluster" in df.columns else None
-
+    elif {"cluster", "cluster_size"}.issubset(df.columns):
+        df_km = df[["client_id", "cluster", "cluster_size"]].copy()
 
     plt.figure(figsize=(8, 6))
     if _HAS_SNS:
         ax = sns.scatterplot(
             data=df,
             x="sim_score", y="combined",
-            hue="flagged", style="cluster" if "cluster" in df.columns else None,
+            hue="flagged",
+            style="cluster" if "cluster" in df.columns else None,
             s=70
         )
     else:
@@ -62,74 +56,178 @@ def plot_sybil_detection():
     plt.savefig(os.path.join(PLOT_DIR, "fig5a_sybil_scatter.png"))
     plt.close()
 
-  
-    if df_km is not None and "cluster_size" in df_km.columns and "cluster" in df_km.columns:
-        cluster_sizes = df_km.drop_duplicates("cluster")[["cluster", "cluster_size"]].sort_values("cluster")
+    if df_km is not None and {"cluster", "cluster_size"}.issubset(df_km.columns):
+        cluster_sizes = df_km.drop_duplicates("cluster")["cluster_size"].astype(int)
+        labels = df_km.drop_duplicates("cluster")["cluster"].astype(str)
         plt.figure(figsize=(7, 5))
         ax = plt.gca()
-        ax.bar(cluster_sizes["cluster"].astype(str), cluster_sizes["cluster_size"])
+        ax.bar(labels, cluster_sizes)
         plt.title("Fig 5-a (Ek): K-means Cluster Sizes")
         plt.xlabel("Cluster")
         plt.ylabel("Cluster Size (#clients)")
-        for i, v in enumerate(cluster_sizes["cluster_size"].tolist()):
+        for i, v in enumerate(cluster_sizes.tolist()):
             ax.text(i, v, str(v), ha="center", va="bottom", fontsize=10)
         plt.tight_layout()
         plt.savefig(os.path.join(PLOT_DIR, "fig5a_sybil_cluster_sizes.png"))
         plt.close()
 
 
+
 def plot_poisoning_impact():
-    """
-    Fig 5-b: Poisoning Detection (Robust Z-scores)
-    Girdi: logs/poisoning_norms.csv
-      - Columns: client_id, l2_norm, robust_z, flagged
-    Çıktı: plots/fig5b_poisoning_zscores.png
-    """
     path = os.path.join(LOG_DIR, "poisoning_norms.csv")
     if not os.path.exists(path):
         print("[!] poisoning_norms.csv bulunamadı. Fig 5-b atlanıyor.")
         return
 
-    df = pd.read_csv(path)
-
-    df = df.sort_values("client_id").reset_index(drop=True)
+    df = pd.read_csv(path).sort_values("client_id").reset_index(drop=True)
 
     plt.figure(figsize=(10, 5.5))
     ax = plt.gca()
     if _HAS_SNS:
-        sns.barplot(
-            data=df,
-            x="client_id", y="robust_z",
-            hue="flagged", dodge=False
-        )
+        sns.barplot(data=df, x="client_id", y="robust_z", hue="flagged", dodge=False)
     else:
         colors = ["C0" if f == 0 else "C3" for f in df.get("flagged", [0]*len(df))]
         ax.bar(df["client_id"].astype(str), df["robust_z"], color=colors)
     plt.title("Fig 5-b: Poisoning Detection — Robust Z-scores")
     plt.xlabel("Client ID")
     plt.ylabel("Robust Z-score (|z| > 3 ⇒ flagged)")
-    plt.legend(title="Flagged", loc="upper right") if _HAS_SNS else None
+    if _HAS_SNS:
+        plt.legend(title="Flagged", loc="upper right")
     plt.grid(True, axis="y", alpha=0.25)
     plt.tight_layout()
     plt.savefig(os.path.join(PLOT_DIR, "fig5b_poisoning_zscores.png"))
     plt.close()
 
 
-def plot_communication_overhead():
+def _parse_cfg_string(cfg_str: str) -> dict:
+    """chain_log.csv içindeki mode alanı str(dict) formatında; güvenli şekilde sözlüğe çevir."""
+    try:
+        d = ast.literal_eval(cfg_str)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_crypto_bytes_per_round() -> pd.DataFrame:
+    """crypto_metrics.csv -> round bazında şifreli bayt toplamı (uplink benzeri).
+    - Eğer o turda client bazlı satırlar (mode=server_decrypt) varsa: bunların cipher_bytes toplamı.
+    - Aksi halde SUM satırı (mode=server_sum_decrypt) varsa: onun cipher_bytes değeri.
     """
-    Fig 5-c: Communication Overhead (Makaledeki sabit sayılar)
-    FL=6.0 MB, CCFL=6.8 MB, Secure-CCFL=9.4 MB
-    Çıktı: plots/fig5c_comm_overhead.png
-    """
-    systems = ["FL", "CCFL", "Secure-CCFL"]
-    overhead = [6.0, 6.8, 9.4]  
+    path = os.path.join(LOG_DIR, "crypto", "crypto_metrics.csv")
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=["round", "crypto_bytes"]).astype({"round": int, "crypto_bytes": int})
+    df = pd.read_csv(path)
+    if "round" not in df.columns:
+        return pd.DataFrame(columns=["round", "crypto_bytes"])  
+    def _to_int_safe(x):
+        try:
+            return int(x)
+        except Exception:
+            return -1
+    df["round_int"] = df["round"].apply(_to_int_safe)
+
+    rows = []
+    for r in sorted(df["round_int"].unique()):
+        if r < 0:
+            continue
+        dfr = df[df["round_int"] == r]
+        d_cli = dfr[dfr["mode"] == "server_decrypt"]
+        if len(d_cli) > 0:
+            crypto_bytes = d_cli["cipher_bytes"].fillna(0).astype(int).sum()
+        else:
+            d_sum = dfr[dfr["mode"] == "server_sum_decrypt"]
+            crypto_bytes = int(d_sum["cipher_bytes"].fillna(0).astype(int).sum()) if len(d_sum) > 0 else 0
+        rows.append({"round": r, "crypto_bytes": crypto_bytes})
+    return pd.DataFrame(rows)
+
+
+def _load_zkp_bytes_per_round() -> pd.DataFrame:
+    path = os.path.join(LOG_DIR, "zkp", "zkp_metrics.csv")
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=["round", "zkp_bytes"]).astype({"round": int, "zkp_bytes": int})
+    df = pd.read_csv(path)
+    if "round" not in df.columns or "size_bytes" not in df.columns:
+        return pd.DataFrame(columns=["round", "zkp_bytes"])  
+    def _to_int_safe(x):
+        try:
+            return int(x)
+        except Exception:
+            return -1
+    df["round_int"] = df["round"].apply(_to_int_safe)
+    d = df[df["round_int"] >= 0].groupby("round_int")["size_bytes"].sum().reset_index()
+    d.columns = ["round", "zkp_bytes"]
+    return d
+
+
+def _load_cfg_per_round() -> pd.DataFrame:
+    path = os.path.join(LOG_DIR, "chain", "chain_log.csv")
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=["round", "category"])
+    df = pd.read_csv(path)
+    if "round" not in df.columns or "mode" not in df.columns:
+        return pd.DataFrame(columns=["round", "category"])
+
+    rows = []
+    for _, row in df.iterrows():
+        r = row.get("round")
+        try:
+            r = int(r)
+        except Exception:
+            continue
+        cfg = _parse_cfg_string(str(row.get("mode", "{}")))
+        secagg = int(cfg.get("secagg", 0))
+        zkp = int(cfg.get("zkp", 0))
+        sybil = int(cfg.get("sybil", 0))
+        poison = int(cfg.get("poison", 0))
+        ldp = int(cfg.get("ldp", 0))
+        clouds = int(cfg.get("clouds", cfg.get("domains", 1)))
+
+        any_security = any([secagg, zkp, sybil, poison, ldp])
+        if not any_security:
+            if clouds and clouds > 1:
+                cat = "CCFL"  
+            else:
+                cat = "FL"    
+        else:
+            cat = "Secure-CCFL" 
+
+        rows.append({"round": r, "category": cat})
+    d = pd.DataFrame(rows).drop_duplicates(subset=["round"], keep="last")
+    return d
+
+
+def plot_communication_overhead_from_csv():
+    crypto_df = _load_crypto_bytes_per_round()
+    zkp_df = _load_zkp_bytes_per_round()
+    cfg_df = _load_cfg_per_round()
+
+    if len(crypto_df) == 0 and len(zkp_df) == 0:
+        print("[!] crypto/zkp CSV’leri bulunamadı. Fig 5-c atlanıyor.")
+        return
+
+    merged = pd.merge(crypto_df, zkp_df, on="round", how="outer").fillna(0)
+    merged["total_bytes"] = merged.get("crypto_bytes", 0) + merged.get("zkp_bytes", 0)
+
+    if len(cfg_df) > 0:
+        merged = pd.merge(merged, cfg_df, on="round", how="left")
+    else:
+        merged["category"] = "Secure-CCFL"  
+
+    merged["total_mb"] = merged["total_bytes"] / (1024 * 1024)
+
+    grp = merged.groupby("category")["total_mb"].mean().reset_index()
+
+    order = ["FL", "CCFL", "Secure-CCFL"]
+    grp["order"] = grp["category"].apply(lambda x: order.index(x) if x in order else len(order))
+    grp = grp.sort_values("order")
+
     plt.figure(figsize=(7, 5))
     ax = plt.gca()
-    ax.bar(systems, overhead)
-    plt.title("Fig 5-c: Communication Overhead per Round (MB)")
+    ax.bar(grp["category"], grp["total_mb"])
+    plt.title("Fig 5-c: Communication Overhead per Round (from CSV)")
     plt.ylabel("Data per Round (MB)")
     plt.grid(True, axis="y", alpha=0.25)
-    _save_annotated_bar(ax, overhead, fmt="{:.1f} MB")
+    _save_labels_on_bars(ax, grp["total_mb"].tolist(), fmt="{:.2f} MB")
     plt.tight_layout()
     plt.savefig(os.path.join(PLOT_DIR, "fig5c_comm_overhead.png"))
     plt.close()
@@ -138,8 +236,8 @@ def plot_communication_overhead():
 def main():
     plot_sybil_detection()
     plot_poisoning_impact()
-    plot_communication_overhead()
-    print("[✓] Grafikler çizildi → klasör: plots/")
+    plot_communication_overhead_from_csv()
+    print("[✓] Grafikler çizildi → plots/ klasörüne bakın.")
 
 
 if __name__ == "__main__":
