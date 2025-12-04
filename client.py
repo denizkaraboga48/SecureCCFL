@@ -338,15 +338,13 @@ class Client:
         if self.attack_type == "poison":
             print(f"[Cloud {self.cloud_id}] Client {self.cloudclient} ***** Poisoned attack applied *****")
             alpha = 0.5
-            noise_sigma = 5.0
+            noise_sigma = 20.0
             vec = (1 - 2 * alpha) * vec + torch.randn_like(vec) * noise_sigma
 
         if self.attack_type == "sybil":
             print(f"[Cloud {self.cloud_id}] Client {self.cloudclient} ***** Sybil attack applied *****")
-            torch.manual_seed(42)
-            direction = torch.randn_like(vec)
-            direction = direction / (direction.norm() + 1e-8)
-            vec = 0.1 * direction + torch.randn_like(vec) * 0.005
+            target_val = 0.333
+            vec = torch.ones_like(vec) * target_val + torch.randn_like(vec) * 0.005
 
         if torch.isnan(vec).any() or torch.isinf(vec).any():
             print(f"[Client {self.cid}] ⚠️ NaN or inf detected in vector! Replacing with safe values.")
