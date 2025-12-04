@@ -287,56 +287,50 @@ def _sybil_detection(
         print("[Sybil Detection] No non-poison candidates to evaluate.")
         return []
 
-    # Vektörleri ve benzerlikleri hazırla
     X = np.vstack([np.asarray(u, np.float32) for u in decrypted_updates])
     S = cosine_similarity(X)
     np.fill_diagonal(S, 1.0)
 
-    # Ortalama benzerlik skoru (self hariç)
-    sim_score = (S.sum(axis=1) - 1.0) / max(1, (N - 1))
+    if N > 1:
+        S_no_self = S.copy()
+        np.fill_diagonal(S_no_self, -1.0)
+        sim_score = S_no_self.max(axis=1).astype(np.float32)
+    else:
+        sim_score = np.zeros(N, dtype=np.float32)
 
-    # K-means kümeleme (benzerlik matrisinin satır vektörlerinde)
     k = 3 if N >= 3 else 2
     try:
         km = KMeans(n_clusters=k, random_state=42, n_init=5)
         cluster_labels = km.fit_predict(S)
     except Exception:
-        # K-means başarısızsa bütün istemcileri tek kümede ele al
         cluster_labels = np.zeros(N, dtype=int)
         k = 1
 
     cluster_sizes = np.bincount(cluster_labels, minlength=k)
 
-    # Reputation güncellemesi (yüksek benzerlikleri teşvik etmeyen tarafsız başlangıçtan)
     sim_thr = 0.95
     lambda_sim = 0.6
     rep_alpha = 0.6
     rep = _load_or_init_reputation(N)
     rep = (1 - rep_alpha) * rep + rep_alpha * (sim_score > sim_thr).astype(np.float32)
 
-    # Combined skor
     combined = (lambda_sim * sim_score) + ((1.0 - lambda_sim) * rep)
     combined_threshold = 0.60
 
-    # Küçük kümeleri şüpheli kabul et (ör. < max(2, N*0.2))
     small_cut = max(2, int(max(1, N) * 0.2))
     small_clusters = set(np.where(cluster_sizes < small_cut)[0].tolist())
 
-    # Aday küme üyeleri + çok yüksek benzerlikliler
     high_sim_candidates = set(np.where(sim_score > sim_thr)[0].tolist())
     cluster_candidates = set(i for i, c in enumerate(cluster_labels) if c in small_clusters)
 
-    # Zehirlenmişleri dışarıda bırak
     cluster_candidates = [i for i in cluster_candidates if i in candidates]
     high_sim_candidates = [i for i in high_sim_candidates if i in candidates]
 
-    # Nihai Sybil bayrağı: küçük küme ÜYEsi veya yüksek benzerlik + combined eşiği geçenler
     sybil_flags = np.zeros(N, dtype=int)
     for i in set(cluster_candidates) | set(high_sim_candidates):
         if combined[i] > combined_threshold:
             sybil_flags[i] = 1
 
-    # Loglar
     df = pd.DataFrame(
         {
             "client_id": list(range(N)),
@@ -350,7 +344,6 @@ def _sybil_detection(
     )
     df.to_csv(os.path.join(LOG_DIR, "sybil_similarity_reputation.csv"), index=False)
 
-    # K-means spesifik log
     pd.DataFrame(
         {
             "client_id": list(range(N)),
@@ -507,7 +500,7 @@ def process_round(
         if not privkey:
             privkey = load_private_key()
         decrypted_updates = _decrypt_all(client_updates, privkey, current_round=current_round)
-        poisoned_indices = _poisoning_detection(decrypted_updates, z_thresh=3.0) if cfg.get("poison", 0) else []
+        poisoned_indices = _poisoning_detection(decrypted_updates, z_thresh=1.5) if cfg.get("poison", 0) else []
         sybil_indices = _sybil_detection(
             decrypted_updates,
             poisoned_indices=poisoned_indices,
