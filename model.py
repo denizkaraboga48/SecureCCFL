@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.models import resnet18, resnet34, ResNet34_Weights, ResNet18_Weights
 
 class ResNetForMNIST(nn.Module):
@@ -25,3 +26,49 @@ class ResNetForMNIST(nn.Module):
 
     def forward(self, x):
         return self.backbone(x)
+    
+
+class TinyCNN(nn.Module):
+    def __init__(self, num_classes: int = 10, dropout_p: float = 0.25):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.dropout = nn.Dropout(p=dropout_p)
+        self.fc1 = nn.Linear(64 * 7 * 7, 512)
+        self.fc2 = nn.Linear(512, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.max_pool2d(x, 2)
+        x = F.relu(self.conv2(x))
+        x = F.max_pool2d(x, 2)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
+
+
+def build_model(
+    model_name: str,
+    num_classes: int = 10,
+    freeze_backbone: bool = True,
+    use_pretrained: bool = True,
+    dropout_p: float = 0.25,
+):
+    name = model_name.lower().strip()
+
+    if name == "tinycnn":
+        return TinyCNN(num_classes=num_classes, dropout_p=dropout_p)
+
+    if name in ("resnet18", "resnet34"):
+        return ResNetForMNIST(
+            num_classes=num_classes,
+            arch=name,
+            freeze_backbone=freeze_backbone,
+            use_pretrained=use_pretrained,
+        )
+
+    raise ValueError(f"Unknown model_name: {model_name}")
+
